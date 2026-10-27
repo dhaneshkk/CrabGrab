@@ -67,6 +67,13 @@ Note that feature examples will require that feature:
 
 `cargo run --example <example name> --feature <feature name>`
 
+Using CrabGrab from WSL
+-----------------------
+
+WSL can't capture the Windows desktop directly, so [`bridge/`](bridge) streams frames from a small Windows sender (`examples/wsl_bridge_sender.rs`) into WSL, where a Rust receiver or a Python/NumPy client picks them up. See [bridge/README.md](bridge/README.md).
+
+`formal/StopFlag.lean` is a Lean 4 proof that the Windows stream delivers `StreamEvent::End` at most once and never delivers a frame after it.
+
 MacOS Docs
 ----------
 Unfortunately due to our dependence on metal-rs, building docs for macos doesn't work on docs.rs, since they use linux containers. As a workaround, we host macos documentation in this repository - link above.
