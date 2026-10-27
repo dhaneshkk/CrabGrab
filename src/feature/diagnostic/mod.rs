@@ -147,8 +147,16 @@ impl FrameDiagnosticExt for crate::prelude::VideoFrame {
                         }
                     }
                 },
-                crate::platform::platform_impl::ImplVideoFrame::CGDisplayStream(_) =>  {
-                    todo!()
+                crate::platform::platform_impl::ImplVideoFrame::CGDisplayStream(cgd_frame) =>  {
+                    // CGDisplayStream frames carry no SCStream info dictionary; report the surface and
+                    // the capture geometry instead of panicking (was todo!())
+                    FrameDiagnostic {
+                        iosurface_info: Some(get_iosurface_info(&cgd_frame.io_surface)),
+                        info_dictionary: vec![
+                            ("source_rect".to_string(), format!("{:?}", cgd_frame.source_rect)),
+                            ("dest_size".to_string(), format!("{:?}", cgd_frame.dest_size)),
+                        ],
+                    }
                 },
             }
         }

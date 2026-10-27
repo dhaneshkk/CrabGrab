@@ -4,7 +4,7 @@ use objc2::runtime::AnyObject;
 
 use crate::{frame::{AudioCaptureFrame, VideoCaptureFrame}, prelude::{AudioBufferError, AudioChannelCount, AudioChannelData, AudioChannelDataSamples, AudioSampleRate, Point}, util::{Rect, Size}};
 
-use super::objc_wrap::{kAudioFormatFlagIsBigEndian, kAudioFormatFlagIsPacked, kAudioFormatFlagsCanonical, kAudioFormatNativeEndian, AVAudioFormat, AVAudioPCMBuffer, AudioBufferList, AudioStreamBasicDescription, CFDictionary, CGRect, CGRectMakeWithDictionaryRepresentation, CMBlockBuffer, CMSampleBuffer, IOSurface, NSDictionary, NSNumber, NSScreen, SCStreamFrameInfoBoundingRect, SCStreamFrameInfoContentRect, SCStreamFrameInfoContentScale, SCStreamFrameInfoScaleFactor, SCStreamFrameInfoScreenRect};
+use super::objc_wrap::{kAudioFormatFlagIsBigEndian, kAudioFormatFlagIsPacked, kAudioFormatFlagsCanonical, kAudioFormatNativeEndian, AVAudioFormat, AVAudioPCMBuffer, AudioBufferList, AudioStreamBasicDescription, CFDictionary, CGPoint, CGRect, CGRectMakeWithDictionaryRepresentation, CMBlockBuffer, CMSampleBuffer, IOSurface, NSDictionary, NSNumber, NSScreen, SCStreamFrameInfoBoundingRect, SCStreamFrameInfoContentRect, SCStreamFrameInfoContentScale, SCStreamFrameInfoScaleFactor, SCStreamFrameInfoScreenRect};
 
 pub(crate) struct MacosSCStreamVideoFrame {
     pub(crate) sample_buffer: CMSampleBuffer,
@@ -81,7 +81,18 @@ impl VideoCaptureFrame for MacosVideoFrame {
                 }
                 dpi
             },
-            MacosVideoFrame::CGDisplayStream(cgd_frame) => todo!()
+            MacosVideoFrame::CGDisplayStream(cgd_frame) => {
+                // Same lookup as the SCStream path, using the captured display region (was todo!(), a panic)
+                let origin = CGPoint { x: cgd_frame.source_rect.origin.x, y: cgd_frame.source_rect.origin.y };
+                let mut dpi = 72.0f64;
+                for screen in NSScreen::screens() {
+                    if screen.frame().contains(origin) {
+                        dpi = screen.dpi();
+                        break;
+                    }
+                }
+                dpi
+            }
         }
     }
 
@@ -133,8 +144,16 @@ impl VideoCaptureFrame for MacosVideoFrame {
                     }
                 }
             },
-            MacosVideoFrame::CGDisplayStream(sc_fame) => {
-                todo!()
+            MacosVideoFrame::CGDisplayStream(cgd_frame) => {
+                // CGDisplayStream fills the whole destination surface, so the content is the full frame
+                // (was todo!(), a panic)
+                Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: cgd_frame.io_surface.get_width() as f64,
+                        height: cgd_frame.io_surface.get_height() as f64,
+                    }
+                }
             }
         }
     }

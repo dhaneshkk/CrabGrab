@@ -3,7 +3,7 @@ use std::{fmt::Debug, sync::{atomic::{self, AtomicBool, AtomicU64}, Arc}, time::
 use crate::prelude::{AudioFrame, Capturable, CaptureConfig, CapturePixelFormat, StreamCreateError, StreamError, StreamEvent, StreamStopError, VideoFrame};
 
 use parking_lot::Mutex;
-use windows::{core::{ComInterface, IInspectable, HSTRING}, Foundation::TypedEventHandler, Graphics::{Capture::{Direct3D11CaptureFramePool, GraphicsCaptureAccess, GraphicsCaptureAccessKind, GraphicsCaptureItem, GraphicsCaptureSession}, DirectX::{Direct3D11::IDirect3DDevice, DirectXPixelFormat}, SizeInt32}, Security::Authorization::AppCapabilityAccess::{AppCapability, AppCapabilityAccessStatus}, Win32::{Foundation::HWND, Graphics::{Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0}, Direct3D11::{D3D11CreateDevice, ID3D11Device, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION}, Dxgi::{CreateDXGIFactory, IDXGIAdapter, IDXGIAdapter4, IDXGIDevice, IDXGIFactory5}}, System::{Com::COINIT_APARTMENTTHREADED, WinRT::{CreateDispatcherQueueController, Direct3D11::CreateDirect3D11DeviceFromDXGIDevice, DispatcherQueueOptions, Graphics::Capture::IGraphicsCaptureItemInterop, DQTAT_COM_NONE, DQTYPE_THREAD_CURRENT}}, UI::{HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_RAW_DPI}, WindowsAndMessaging::{DispatchMessageW, GetMessageW, TranslateMessage, MSG}}}};
+use windows::{core::{ComInterface, IInspectable, HSTRING}, Foundation::TypedEventHandler, Graphics::{Capture::{Direct3D11CaptureFramePool, GraphicsCaptureAccess, GraphicsCaptureAccessKind, GraphicsCaptureItem, GraphicsCaptureSession}, DirectX::{Direct3D11::IDirect3DDevice, DirectXPixelFormat}, SizeInt32}, Security::Authorization::AppCapabilityAccess::{AppCapability, AppCapabilityAccessStatus}, Win32::{Foundation::{HWND, LPARAM, WPARAM}, Graphics::{Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0}, Direct3D11::{D3D11CreateDevice, ID3D11Device, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION}, Dxgi::{CreateDXGIFactory, IDXGIAdapter, IDXGIAdapter4, IDXGIDevice, IDXGIFactory5}}, System::{Com::COINIT_APARTMENTTHREADED, WinRT::{CreateDispatcherQueueController, Direct3D11::CreateDirect3D11DeviceFromDXGIDevice, DispatcherQueueOptions, Graphics::Capture::IGraphicsCaptureItemInterop, DQTAT_COM_NONE, DQTYPE_THREAD_CURRENT}}, System::Threading::GetCurrentThreadId, UI::{HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_RAW_DPI}, WindowsAndMessaging::{DispatchMessageW, GetMessageW, PostThreadMessageW, TranslateMessage, MSG, WM_QUIT}}}};
 
 use super::{audio_capture_stream::{WindowsAudioCaptureStream, WindowsAudioCaptureStreamError, WindowsAudioCaptureStreamPacket}, frame::{WindowsAudioFrame, WindowsVideoFrame}, AutoCom};
 
@@ -109,6 +109,11 @@ pub struct WindowsCaptureStream {
     auto_com: AutoCom,
     shared_handler_data: Arc<SharedHandlerData>,
     audio_stream: Option<WindowsAudioCaptureStream>,
+    /// Win32 thread id of the thread running this stream's message loop; used to post WM_QUIT on stop
+    message_thread_id: u32,
+    /// Set once the session/pool are closed and WM_QUIT posted. Separate from `closed`, which the
+    /// Closed event can set first; teardown must still happen exactly once in that case.
+    torn_down: bool,
 }
 
 unsafe impl Send for WindowsCaptureStream {}
@@ -304,9 +309,11 @@ impl WindowsCaptureStream {
         let audio_handler_data = shared_handler_data.clone();
 
         let close_handler = TypedEventHandler::new(move |_, _| {
-            let alread_closed = close_handler_data.closed.fetch_and(true, atomic::Ordering::AcqRel);
-            if !alread_closed {
-                let mut callback = close_handler_data.callback.lock();
+            // Take the callback lock *before* flipping the flag so no frame can be delivered after End
+            let mut callback = close_handler_data.callback.lock();
+            // fetch_or (not fetch_and!) so the flag actually becomes true; returns the previous value
+            let already_closed = close_handler_data.closed.fetch_or(true, atomic::Ordering::AcqRel);
+            if !already_closed {
                 (*callback)(Ok(StreamEvent::End));
             }
             Ok(())
@@ -336,13 +343,9 @@ impl WindowsCaptureStream {
                     Duration::ZERO
                 }
             };
-            let duration = match t_last_frame {
-                Some(t_last_frame) => t_capture - t_last_frame,
-                None => {
-                    t_last_frame = Some(t_capture);
-                    Duration::ZERO
-                }
-            };
+            // Time since the previous frame (previously t_last_frame was never updated after the first frame)
+            let duration = t_last_frame.map_or(Duration::ZERO, |t_last: Instant| t_capture - t_last);
+            t_last_frame = Some(t_capture);
             let dpi = unsafe { 
                 match &callback_target {
                     Capturable::Window(window) => GetDpiForWindow(window.impl_capturable_window.0),
@@ -355,7 +358,10 @@ impl WindowsCaptureStream {
                 }
             };
             let mut callback = frame_handler_data.callback.lock();
-            //let window_rect = RECT::default();
+            // Re-check under the lock: stop() may have emitted End while we waited for it
+            if frame_handler_data.closed.load(atomic::Ordering::Acquire) {
+                return Ok(());
+            }
             let frame = match frame_pool.TryGetNextFrame() {
                 Ok(frame) => frame,
                 Err(e) => {
@@ -412,10 +418,16 @@ impl WindowsCaptureStream {
                                 frame_id: audio_frame_id
                             }
                         });
-                        (*audio_handler_data.callback.lock())(Ok(event));
+                        let mut callback = audio_handler_data.callback.lock();
+                        if !audio_handler_data.closed.load(atomic::Ordering::Acquire) {
+                            (*callback)(Ok(event));
+                        }
                     },
-                    Err(_) => {
-                        (*audio_handler_data.callback.lock())(Err(StreamError::Other("Audio stream error".to_string())));
+                    Err(error) => {
+                        let mut callback = audio_handler_data.callback.lock();
+                        if !audio_handler_data.closed.load(atomic::Ordering::Acquire) {
+                            (*callback)(Err(StreamError::Other(format!("Audio stream error: {:?}", error))));
+                        }
                     }
                 }
             });
@@ -479,7 +491,7 @@ impl WindowsCaptureStream {
                         return;
                     };
                     
-                    let thread_shared_handler_data = shared_handler_data.clone();
+                    let message_thread_id = unsafe { GetCurrentThreadId() };
 
                     let stream = WindowsCaptureStream {
                         dxgi_adapter,
@@ -493,12 +505,21 @@ impl WindowsCaptureStream {
                         auto_com: AutoCom::no_init(),
                         shared_handler_data,
                         audio_stream,
+                        message_thread_id,
+                        torn_down: false,
                     };
 
                     _ = init_tx.send(Ok(stream));
 
                     let mut message = MSG::default();
-                    while unsafe { GetMessageW(&mut message as *mut _, HWND::default(), 0, 0) }.as_bool() && !thread_shared_handler_data.closed.load(atomic::Ordering::SeqCst) {
+                    // GetMessageW returns 0 on WM_QUIT and -1 on error; BOOL::as_bool() treats -1 as true,
+                    // which would spin forever, so compare explicitly. stop() posts WM_QUIT to end this loop,
+                    // otherwise this thread (and its STA) leaked for every stream ever created.
+                    loop {
+                        let result = unsafe { GetMessageW(&mut message as *mut _, HWND::default(), 0, 0) }.0;
+                        if result <= 0 {
+                            break;
+                        }
                         unsafe {
                             TranslateMessage(&message as *const _);
                             DispatchMessageW(&message as *const _);
@@ -516,21 +537,37 @@ impl WindowsCaptureStream {
             })
     }
 
-    pub fn stop(&self) -> Result<(), StreamStopError> {
-        let already_closed = self.shared_handler_data.closed.fetch_and(true, atomic::Ordering::AcqRel);
-        if !already_closed {
-            (*self.shared_handler_data.callback.lock())(Ok(StreamEvent::End));
+    /// Stops the stream. Idempotent: `StreamEvent::End` is delivered at most once and later calls return `Ok(())`.
+    ///
+    /// Note: must not be called from inside the stream callback (the callback lock is not re-entrant).
+    pub fn stop(&mut self) -> Result<(), StreamStopError> {
+        // Stop audio first (joins its worker) so it can't deliver after End
+        if let Some(audio_stream) = &mut self.audio_stream {
+            audio_stream.stop();
         }
-        self.capture_session.Close().map_err(|_| StreamStopError::Other("Failed to close capture session".into()))?;
-        Ok(())
+        {
+            let mut callback = self.shared_handler_data.callback.lock();
+            // fetch_or returns the previous value; fetch_and(true) never changed the flag, so End fired
+            // on every stop()/drop and frames kept flowing after stop.
+            let already_closed = self.shared_handler_data.closed.fetch_or(true, atomic::Ordering::AcqRel);
+            if !already_closed {
+                (*callback)(Ok(StreamEvent::End));
+            }
+        }
+        if self.torn_down {
+            return Ok(());
+        }
+        self.torn_down = true;
+        let session_result = self.capture_session.Close();
+        let _ = self.frame_pool.Close();
+        // End the message loop so the capture thread exits instead of blocking in GetMessageW forever
+        let _ = unsafe { PostThreadMessageW(self.message_thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) };
+        session_result.map_err(|_| StreamStopError::Other("Failed to close capture session".into()))
     }
 }
 
 impl Drop for WindowsCaptureStream {
     fn drop(&mut self) {
         let _ = self.stop();
-        if let Some(audio_stream) = &mut self.audio_stream {
-            audio_stream.stop();
-        }
     }
 }

@@ -11,7 +11,7 @@ repository = "https://github.com/AugmendTech/CrabGrab"
 license = "MIT OR Apache-2.0"
 keywords = ["capture", "graphics", "window", "screen", "media"]
 categories = ["graphics", "hardware-support", "multimedia", "os"]
-exclude = ["spellcheck/", "update_doc_copy.ps1", "update_doc_copy.sh", "docs/", ".gitignore", ".vscode/"]
+exclude = ["spellcheck/", "bridge/", "update_doc_copy.ps1", "update_doc_copy.sh", "docs/", ".gitignore", ".vscode/"]
 
 [package.metadata.docs.rs]
 features = ["iosurface", "metal", "dxgi", "dx11", "bitmap", "screenshot", "wgpu"]
@@ -90,3 +90,7 @@ winapi = { version = "0.3", optional = true }
 futures = "0.3"
 tokio = { version = "1.37", features = ["rt", "macros", "rt-multi-thread"] }
 wgpu = "0.20"
+
+[[example]]
+name = "wsl_bridge_sender"
+required-features = ["bitmap"]
